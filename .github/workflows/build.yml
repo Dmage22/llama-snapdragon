@@ -1,0 +1,88 @@
+# Upstream llama.cpp for Android with its Snapdragon backends (Hexagon NPU and Adreno OpenCL),
+# built as llama.cpp's docs/backend/snapdragon/README.md says, in Qualcomm's own toolchain image,
+# and published as the rolling `latest` release for Termux. Started by hand only.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: llama.cpp branch, tag or commit
+        default: master
+      toolchain:
+        description: ghcr.io/snapdragon-toolchain/arm64-android tag (llama.cpp's docs name it)
+        default: v0.8
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: arm64 Android, HTP + OpenCL
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      IMAGE: ghcr.io/snapdragon-toolchain/arm64-android:${{ inputs.toolchain }}
+    steps:
+      # The image and the build need more room than the runner leaves free.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ inputs.llama_ref }}
+          path: llama.cpp
+
+      - name: Pull the toolchain
+        run: docker pull --platform linux/amd64 "$IMAGE"
+
+      # The preset is upstream's (arm64-v8a, GGML_HEXAGON and GGML_OPENCL on, the Hexagon SDK in the
+      # image). The NDK's libc++_shared.so goes into lib/, since Termux has none of its own; the DSP
+      # skels (libggml-htp-*) are Hexagon code and are left unstripped.
+      - name: Build
+        working-directory: llama.cpp
+        run: |
+          cp docs/backend/snapdragon/CMakeUserPresets.json .
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
+            --platform linux/amd64 "$IMAGE" bash -c '
+              set -euo pipefail
+              cmake --preset arm64-android-snapdragon-release -B build-snapdragon -DLLAMA_BUILD_TESTS=OFF
+              cmake --build build-snapdragon -j"$(nproc)"
+              cmake --install build-snapdragon --prefix /workspace/pkg/llama.cpp
+              ndk="${ANDROID_NDK_ROOT:-/opt/android-ndk-r28b}"
+              cp "$(find "$ndk/toolchains/llvm/prebuilt" -path "*aarch64-linux-android/libc++_shared.so" | head -1)" \
+                /workspace/pkg/llama.cpp/lib/
+              strip="$(find "$ndk/toolchains/llvm/prebuilt" -name llvm-strip | head -1)"
+              for f in /workspace/pkg/llama.cpp/bin/* /workspace/pkg/llama.cpp/lib/*.so; do
+                case "$f" in *libggml-htp-*) ;; *) "$strip" --strip-unneeded "$f" || true ;; esac
+              done'
+
+      - name: Package
+        id: pkg
+        working-directory: llama.cpp
+        run: |
+          rm -rf pkg/llama.cpp/include pkg/llama.cpp/lib/cmake pkg/llama.cpp/lib/pkgconfig pkg/llama.cpp/lib/*.a
+          git rev-parse HEAD > pkg/llama.cpp/LLAMA_COMMIT
+          echo "$IMAGE" > pkg/llama.cpp/TOOLCHAIN
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          ls pkg/llama.cpp/bin pkg/llama.cpp/lib
+          tar -cJf ../llama.cpp-snapdragon-android.tar.xz -C pkg llama.cpp
+          cd .. && sha256sum llama.cpp-snapdragon-android.tar.xz > sha256sums.txt && cat sha256sums.txt
+          ls -lh llama.cpp-snapdragon-android.tar.xz
+
+      - name: Publish the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          notes="llama.cpp ggml-org/llama.cpp@${{ steps.pkg.outputs.commit }}, built in $IMAGE by ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh release view latest >/dev/null 2>&1 || gh release create latest --title "Latest build" --notes "$notes"
+          gh release upload latest llama.cpp-snapdragon-android.tar.xz sha256sums.txt --clobber
+          gh release edit latest --notes "$notes"
