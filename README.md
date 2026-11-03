@@ -31,3 +31,9 @@ LD_LIBRARY_PATH=~/llama-snapdragon/lib ADSP_LIBRARY_PATH=~/llama-snapdragon/lib 
 
 `Q4_0` is the quant the NPU backend is built around. The DSP has to accept unsigned code for this to
 work, which is a property of the phone's firmware, not of the build.
+
+## Tested devices
+
+- Galaxy Z Fold 8 (SM8850, Hexagon v81): the NPU works, about 19.6 t/s generating on a 4B-class
+  Q4_0 model; GPUOpenCL doesn't. Numbers, memory, and which quants have NPU kernels are in
+  [docs/galaxy-z-fold8.md](docs/galaxy-z-fold8.md).
